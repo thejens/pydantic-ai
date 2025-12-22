@@ -10,6 +10,7 @@ from typing import (
     Any,
     cast,
 )
+from uuid import uuid4
 
 from ... import ExternalToolset, ToolDefinition
 from ...messages import (
@@ -20,8 +21,12 @@ from ...messages import (
     DocumentUrl,
     ImageUrl,
     ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -38,11 +43,13 @@ try:
         BaseEvent,
         BinaryInputContent,
         DeveloperMessage,
+        FunctionCall,
         Message,
         RunAgentInput,
         SystemMessage,
         TextInputContent,
         Tool as AGUITool,
+        ToolCall,
         ToolMessage,
         UserMessage,
     )
@@ -232,3 +239,105 @@ class AGUIAdapter(UIAdapter[RunAgentInput, Message, BaseEvent, AgentDepsT, Outpu
                     raise ValueError(f'Unsupported message type: {type(msg)}')
 
         return builder.messages
+
+    @classmethod
+    def dump_messages(cls, messages: Sequence[ModelMessage]) -> list[Message]:
+        """Transform Pydantic AI messages into AG-UI messages.
+
+        Args:
+            messages: A sequence of ModelMessage objects to convert.
+
+        Returns:
+            A list of AG-UI Message objects.
+        """
+        result: list[Message] = []
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                cls._dump_request_parts(msg, result)
+            elif isinstance(msg, ModelResponse):
+                cls._dump_response_parts(msg, result)
+
+        return result
+
+    @classmethod
+    def _dump_request_parts(cls, msg: ModelRequest, result: list[Message]) -> None:
+        """Convert ModelRequest parts to AG-UI messages."""
+        for part in msg.parts:
+            if isinstance(part, SystemPromptPart):
+                result.append(SystemMessage(id=str(uuid4()), role='system', content=part.content))
+            elif isinstance(part, UserPromptPart):
+                content = part.content if isinstance(part.content, str) else str(part.content)
+                result.append(UserMessage(id=str(uuid4()), role='user', content=content))
+            elif isinstance(part, ToolReturnPart):
+                result.append(
+                    ToolMessage(
+                        id=str(uuid4()),
+                        role='tool',
+                        tool_call_id=part.tool_call_id,
+                        content=part.model_response_str(),
+                    )
+                )
+            elif isinstance(part, RetryPromptPart) and part.tool_call_id:
+                result.append(
+                    ToolMessage(
+                        id=str(uuid4()),
+                        role='tool',
+                        tool_call_id=part.tool_call_id,
+                        content=part.model_response(),
+                    )
+                )
+
+    @classmethod
+    def _dump_response_parts(cls, msg: ModelResponse, result: list[Message]) -> None:
+        """Convert ModelResponse parts to AG-UI messages."""
+        current_content: str = ''
+        current_tool_calls: list[ToolCall] = []
+
+        def flush() -> None:
+            nonlocal current_content, current_tool_calls
+            if current_content or current_tool_calls:
+                result.append(
+                    AssistantMessage(
+                        id=str(uuid4()),
+                        role='assistant',
+                        content=current_content or None,
+                        tool_calls=current_tool_calls or None,
+                    )
+                )
+                current_content = ''
+                current_tool_calls = []
+
+        for part in msg.parts:
+            if isinstance(part, TextPart):
+                if current_tool_calls:
+                    flush()
+                current_content += part.content
+            elif isinstance(part, ThinkingPart):
+                pass  # Skip - no AG-UI equivalent
+            elif isinstance(part, ToolCallPart | BuiltinToolCallPart):
+                if current_content and not current_tool_calls:
+                    flush()
+                current_tool_calls.append(cls._make_tool_call(part))
+            elif isinstance(part, BuiltinToolReturnPart):
+                flush()
+                prefixed_id = f'{BUILTIN_TOOL_CALL_ID_PREFIX}|{part.provider_name}|{part.tool_call_id}'
+                result.append(
+                    ToolMessage(id=str(uuid4()), role='tool', tool_call_id=prefixed_id, content=part.model_response_str())
+                )
+            # FilePart has no direct AG-UI equivalent, skip
+
+        flush()
+
+    @staticmethod
+    def _make_tool_call(part: ToolCallPart | BuiltinToolCallPart) -> ToolCall:
+        """Create a ToolCall from a ToolCallPart or BuiltinToolCallPart."""
+        if isinstance(part, BuiltinToolCallPart):
+            tool_call_id = f'{BUILTIN_TOOL_CALL_ID_PREFIX}|{part.provider_name}|{part.tool_call_id}'
+        else:
+            tool_call_id = part.tool_call_id
+        return ToolCall(
+            id=tool_call_id,
+            type='function',
+            function=FunctionCall(name=part.tool_name, arguments=part.args_as_json_str()),
+        )

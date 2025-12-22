@@ -31,9 +31,11 @@ from pydantic_ai import (
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     TextPartDelta,
+    ThinkingPart,
     ToolCallPart,
     ToolCallPartDelta,
     ToolReturn,
@@ -2337,3 +2339,364 @@ async def test_handle_ag_ui_request():
             {'type': 'http.response.body', 'body': b'', 'more_body': False},
         ]
     )
+
+
+async def test_dump_messages_basic() -> None:
+    """Test basic message type conversion with dump_messages."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content='System instruction'),
+                UserPromptPart(content='Hello'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                TextPart(content='Hi there!'),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    assert len(ag_ui_messages) == 3
+    assert isinstance(ag_ui_messages[0], SystemMessage)
+    assert ag_ui_messages[0].content == 'System instruction'
+    assert isinstance(ag_ui_messages[1], UserMessage)
+    assert ag_ui_messages[1].content == 'Hello'
+    assert isinstance(ag_ui_messages[2], AssistantMessage)
+    assert ag_ui_messages[2].content == 'Hi there!'
+    assert ag_ui_messages[2].tool_calls is None
+
+
+async def test_dump_messages_tool_calls() -> None:
+    """Test tool call conversion with dump_messages."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='What is the weather?'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='get_weather',
+                    args='{"location": "Paris"}',
+                    tool_call_id='call_123',
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='get_weather',
+                    content='Sunny, 25°C',
+                    tool_call_id='call_123',
+                ),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                TextPart(content='The weather in Paris is sunny and 25°C.'),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    assert len(ag_ui_messages) == 4
+    # UserMessage
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'What is the weather?'
+    # AssistantMessage with tool call
+    assert isinstance(ag_ui_messages[1], AssistantMessage)
+    assert ag_ui_messages[1].content is None
+    assert ag_ui_messages[1].tool_calls is not None
+    assert len(ag_ui_messages[1].tool_calls) == 1
+    assert ag_ui_messages[1].tool_calls[0].id == 'call_123'
+    assert ag_ui_messages[1].tool_calls[0].function.name == 'get_weather'
+    assert ag_ui_messages[1].tool_calls[0].function.arguments == '{"location": "Paris"}'
+    # ToolMessage
+    assert isinstance(ag_ui_messages[2], ToolMessage)
+    assert ag_ui_messages[2].tool_call_id == 'call_123'
+    assert ag_ui_messages[2].content == 'Sunny, 25°C'
+    # AssistantMessage with text
+    assert isinstance(ag_ui_messages[3], AssistantMessage)
+    assert ag_ui_messages[3].content == 'The weather in Paris is sunny and 25°C.'
+    assert ag_ui_messages[3].tool_calls is None
+
+
+async def test_dump_messages_builtin_tool_calls() -> None:
+    """Test builtin tool call conversion with special ID prefix."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Search for Python tutorials'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='web_search',
+                    args='{"query": "Python tutorials"}',
+                    tool_call_id='search_1',
+                    provider_name='function',
+                ),
+                BuiltinToolReturnPart(
+                    tool_name='web_search',
+                    content='{"results": [{"title": "Learn Python"}]}',
+                    tool_call_id='search_1',
+                    provider_name='function',
+                ),
+                TextPart(content='I found some Python tutorials.'),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    assert len(ag_ui_messages) == 4
+    # UserMessage
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'Search for Python tutorials'
+    # AssistantMessage with builtin tool call
+    assert isinstance(ag_ui_messages[1], AssistantMessage)
+    assert ag_ui_messages[1].content is None
+    assert ag_ui_messages[1].tool_calls is not None
+    assert len(ag_ui_messages[1].tool_calls) == 1
+    assert ag_ui_messages[1].tool_calls[0].id == 'pyd_ai_builtin|function|search_1'
+    assert ag_ui_messages[1].tool_calls[0].function.name == 'web_search'
+    # ToolMessage for builtin tool return
+    assert isinstance(ag_ui_messages[2], ToolMessage)
+    assert ag_ui_messages[2].tool_call_id == 'pyd_ai_builtin|function|search_1'
+    assert ag_ui_messages[2].content == '{"results": [{"title": "Learn Python"}]}'
+    # AssistantMessage with text
+    assert isinstance(ag_ui_messages[3], AssistantMessage)
+    assert ag_ui_messages[3].content == 'I found some Python tutorials.'
+
+
+async def test_dump_messages_multiple_tool_calls() -> None:
+    """Test multiple tool calls in a single response."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Get weather for Paris and London'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='get_weather',
+                    args='{"location": "Paris"}',
+                    tool_call_id='call_1',
+                ),
+                ToolCallPart(
+                    tool_name='get_weather',
+                    args='{"location": "London"}',
+                    tool_call_id='call_2',
+                ),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    assert len(ag_ui_messages) == 2
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'Get weather for Paris and London'
+    # AssistantMessage with multiple tool calls
+    assert isinstance(ag_ui_messages[1], AssistantMessage)
+    assert ag_ui_messages[1].content is None
+    assert ag_ui_messages[1].tool_calls is not None
+    assert len(ag_ui_messages[1].tool_calls) == 2
+    assert ag_ui_messages[1].tool_calls[0].id == 'call_1'
+    assert ag_ui_messages[1].tool_calls[0].function.arguments == '{"location": "Paris"}'
+    assert ag_ui_messages[1].tool_calls[1].id == 'call_2'
+    assert ag_ui_messages[1].tool_calls[1].function.arguments == '{"location": "London"}'
+
+
+async def test_dump_messages_retry_prompt() -> None:
+    """Test RetryPromptPart conversion."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Call the tool'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='my_tool',
+                    args='{"invalid": "args"}',
+                    tool_call_id='call_retry',
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Invalid arguments provided',
+                    tool_name='my_tool',
+                    tool_call_id='call_retry',
+                ),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    assert len(ag_ui_messages) == 3
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'Call the tool'
+    assert isinstance(ag_ui_messages[1], AssistantMessage)
+    assert ag_ui_messages[1].tool_calls is not None
+    assert ag_ui_messages[1].tool_calls[0].id == 'call_retry'
+    # RetryPromptPart becomes ToolMessage (model_response() adds suffix)
+    assert isinstance(ag_ui_messages[2], ToolMessage)
+    assert ag_ui_messages[2].tool_call_id == 'call_retry'
+    assert 'Invalid arguments provided' in ag_ui_messages[2].content
+    assert 'Fix the errors and try again.' in ag_ui_messages[2].content
+
+
+async def test_dump_messages_thinking_part_skipped() -> None:
+    """Test that ThinkingPart is skipped in conversion."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Think about this'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ThinkingPart(content='Let me think...'),
+                TextPart(content='Here is my answer.'),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    # ThinkingPart should be skipped, only TextPart should appear
+    assert len(ag_ui_messages) == 2
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'Think about this'
+    assert isinstance(ag_ui_messages[1], AssistantMessage)
+    assert ag_ui_messages[1].content == 'Here is my answer.'
+    assert ag_ui_messages[1].tool_calls is None
+
+
+async def test_dump_messages_text_then_tool_calls() -> None:
+    """Test text followed by tool calls creates separate messages."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Hello'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                TextPart(content='Let me help you with that.'),
+                ToolCallPart(
+                    tool_name='helper',
+                    args='{}',
+                    tool_call_id='call_after_text',
+                ),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    assert len(ag_ui_messages) == 3
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'Hello'
+    # First AssistantMessage with text
+    assert isinstance(ag_ui_messages[1], AssistantMessage)
+    assert ag_ui_messages[1].content == 'Let me help you with that.'
+    assert ag_ui_messages[1].tool_calls is None
+    # Second AssistantMessage with tool call
+    assert isinstance(ag_ui_messages[2], AssistantMessage)
+    assert ag_ui_messages[2].content is None
+    assert ag_ui_messages[2].tool_calls is not None
+    assert ag_ui_messages[2].tool_calls[0].id == 'call_after_text'
+
+
+async def test_dump_messages_roundtrip() -> None:
+    """Test that load_messages then dump_messages preserves message semantics."""
+    original_ag_ui_messages: list[Message] = [
+        SystemMessage(id='sys1', role='system', content='Be helpful'),
+        UserMessage(id='usr1', role='user', content='Hello'),
+        AssistantMessage(id='ast1', role='assistant', content='Hi!', tool_calls=None),
+        UserMessage(id='usr2', role='user', content='What is the weather?'),
+        AssistantMessage(
+            id='ast2',
+            role='assistant',
+            content=None,
+            tool_calls=[
+                ToolCall(
+                    id='call_weather',
+                    type='function',
+                    function=FunctionCall(name='get_weather', arguments='{"location": "NYC"}'),
+                )
+            ],
+        ),
+        ToolMessage(id='tool1', role='tool', tool_call_id='call_weather', content='Sunny'),
+        AssistantMessage(id='ast3', role='assistant', content='It is sunny in NYC.', tool_calls=None),
+    ]
+
+    # Convert to pydantic messages
+    pydantic_messages = AGUIAdapter.load_messages(original_ag_ui_messages)
+
+    # Convert back to AG-UI messages
+    roundtrip_ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    # The roundtrip should preserve the message semantics (IDs will be different)
+    assert len(roundtrip_ag_ui_messages) == 7
+    # Check message types and content match
+    assert isinstance(roundtrip_ag_ui_messages[0], SystemMessage)
+    assert roundtrip_ag_ui_messages[0].content == 'Be helpful'
+    assert isinstance(roundtrip_ag_ui_messages[1], UserMessage)
+    assert roundtrip_ag_ui_messages[1].content == 'Hello'
+    assert isinstance(roundtrip_ag_ui_messages[2], AssistantMessage)
+    assert roundtrip_ag_ui_messages[2].content == 'Hi!'
+    assert isinstance(roundtrip_ag_ui_messages[3], UserMessage)
+    assert roundtrip_ag_ui_messages[3].content == 'What is the weather?'
+    assert isinstance(roundtrip_ag_ui_messages[4], AssistantMessage)
+    assert roundtrip_ag_ui_messages[4].tool_calls is not None
+    assert roundtrip_ag_ui_messages[4].tool_calls[0].id == 'call_weather'
+    assert isinstance(roundtrip_ag_ui_messages[5], ToolMessage)
+    assert roundtrip_ag_ui_messages[5].tool_call_id == 'call_weather'
+    assert roundtrip_ag_ui_messages[5].content == 'Sunny'
+    assert isinstance(roundtrip_ag_ui_messages[6], AssistantMessage)
+    assert roundtrip_ag_ui_messages[6].content == 'It is sunny in NYC.'
+
+
+async def test_dump_messages_empty() -> None:
+    """Test dump_messages with empty input."""
+    ag_ui_messages = AGUIAdapter.dump_messages([])
+    assert ag_ui_messages == []
+
+
+async def test_dump_messages_retry_prompt_with_auto_generated_id() -> None:
+    """Test RetryPromptPart with auto-generated tool_call_id is converted."""
+    pydantic_messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='Hello'),
+                RetryPromptPart(
+                    content='Please try again',
+                    # tool_call_id is auto-generated
+                ),
+            ]
+        ),
+    ]
+
+    ag_ui_messages = AGUIAdapter.dump_messages(pydantic_messages)
+
+    # RetryPromptPart always has a tool_call_id (auto-generated if not provided)
+    # so it will be converted to a ToolMessage
+    assert len(ag_ui_messages) == 2
+    assert isinstance(ag_ui_messages[0], UserMessage)
+    assert ag_ui_messages[0].content == 'Hello'
+    assert isinstance(ag_ui_messages[1], ToolMessage)
+    assert 'Please try again' in ag_ui_messages[1].content
